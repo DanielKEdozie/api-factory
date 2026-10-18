@@ -29,6 +29,8 @@ class ApiProvider:
         db: Any = None,
         *,
         endpoint_name: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        resource_name: Optional[str] = None,
         route_prefix: Optional[str] = None,
         url_prefix: Optional[str] = None,
         pk_name: str = "id",
@@ -38,6 +40,7 @@ class ApiProvider:
         page_size: int = 20,
         per_page: Optional[int] = None,
         max_page_size: int = 100,
+        max_per_page: Optional[int] = None,
         filter_fields: Optional[List[str]] = None,
         filter_types: Optional[Dict[str, Callable]] = None,
         sort_fields: Optional[List[str]] = None,
@@ -82,8 +85,10 @@ class ApiProvider:
         self._db = db
 
         # Endpoint naming & route prefixing
-        self.endpoint_name = endpoint_name or model.__tablename__
+        self.endpoint_name = endpoint_name or endpoint or resource_name or model.__tablename__
         prefix = route_prefix if route_prefix is not None else url_prefix
+        if prefix is None and resource_name:
+            prefix = f"/{resource_name.lstrip('/')}"
         self.route_prefix = prefix if prefix is not None else f"/{self.endpoint_name}"
 
         # Primary key routing configuration
@@ -94,7 +99,7 @@ class ApiProvider:
         # Pagination
         self.paginate = paginate
         self.page_size = per_page or page_size
-        self.max_page_size = max_page_size
+        self.max_page_size = max_per_page or max_page_size
 
         # Query options
         self.filter_fields = list(filter_fields or [])

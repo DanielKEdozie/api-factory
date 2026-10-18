@@ -23,6 +23,20 @@ class SchemaBuilder:
         self.model = model
         self.schema = None
 
+        if ma is None:
+            try:
+                from flask import current_app, has_app_context
+                if has_app_context():
+                    ma = current_app.extensions.get("marshmallow") or getattr(current_app.extensions.get("api_factory"), "ma", None)
+            except Exception:
+                pass
+            if ma is None:
+                try:
+                    from app.extensions import ma as _app_ma
+                    ma = _app_ma
+                except Exception:
+                    pass
+
         # 1. Try flask_api_builder's SchemaBuilder if ma is available or configured
         try:
             from flask_api_builder.schema_builder import SchemaBuilder as _BaseSchemaBuilder
