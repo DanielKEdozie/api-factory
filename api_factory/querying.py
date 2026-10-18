@@ -160,28 +160,58 @@ def apply_sorting(
     model: Any,
     sort_fields: Optional[List[str]],
     raw_sort: bool,
-    sort_param: Optional[str],
-    order_param: Optional[str]
+    sort_param: Optional[Any],
+    order_param: Optional[str] = None,
+    default_sort: Optional[str] = None,
+    default_order: str = "asc",
 ) -> Any:
-    """Appends ORDER BY clauses from ?sort= and ?order=."""
-    if not sort_param:
-        return stmt
-
-    sort_clean = sort_param.strip()
-    order = (order_param or "asc").strip().lower()
-    descending = order in ("desc", "descending")
-
-    if raw_sort:
-        try:
-            direction = "DESC" if descending else "ASC"
-            stmt = stmt.order_by(text(f"{sort_clean} {direction}"))
-        except Exception as exc:
-            log.warning("Invalid raw sort %s: %s", sort_clean, exc)
-        return stmt
-
+    """Appends ORDER BY clauses from ?sort= and ?order=, or falls back to default_sort."""
     allowed = set(sort_fields or [])
-    if sort_clean in allowed and hasattr(model, sort_clean):
-        col = getattr(model, sort_clean)
-        stmt = stmt.order_by(desc(col) if descending else asc(col))
+    if default_sort:
+        allowed.add(default_sort)
+
+    # If no sort parameter was supplied in query params, apply default sorting
+    if not sort_param:
+        fallback_field = default_sort or (sort_fields[0] if sort_fields else None)
+        if not fallback_field:
+            return stmt
+        default_dir = (order_param or default_order or "asc").strip().lower()
+        descending = default_dir in ("desc", "descending")
+        if hasattr(model, fallback_field):
+            col = getattr(model, fallback_field)
+            stmt = stmt.order_by(desc(col) if descending else asc(col))
+        return stmt
+
+    # Tokenize sort_param (handles string "name,created_at", list ["name", "created_at"], "-name", etc.)
+    tokens: List[str] = []
+    if isinstance(sort_param, list):
+        for item in sort_param:
+            tokens.extend([t.strip() for t in str(item).split(",") if t.strip()])
+    elif isinstance(sort_param, str):
+        tokens = [t.strip() for t in sort_param.split(",") if t.strip()]
+
+    global_order = (order_param or default_order or "asc").strip().lower()
+    global_desc = global_order in ("desc", "descending")
+
+    for token in tokens:
+        descending = global_desc
+        clean = token
+        if clean.startswith("-"):
+            descending = True
+            clean = clean[1:].strip()
+        elif clean.startswith("+"):
+            descending = False
+            clean = clean[1:].strip()
+
+        if raw_sort:
+            try:
+                direction = "DESC" if descending else "ASC"
+                stmt = stmt.order_by(text(f"{clean} {direction}"))
+            except Exception as exc:
+                log.warning("Invalid raw sort %s: %s", clean, exc)
+        else:
+            if clean in allowed and hasattr(model, clean):
+                col = getattr(model, clean)
+                stmt = stmt.order_by(desc(col) if descending else asc(col))
 
     return stmt

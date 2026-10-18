@@ -119,9 +119,12 @@ class CollectionView(MethodView):
         stmt = apply_eager_loads(stmt, model, "collection", builder.eager_loads)
         stmt = apply_filters(stmt, model, builder.filter_fields, builder.filter_types, request.args)
         stmt = apply_search(stmt, model, builder.search_fields, request.args.get("q"))
+        sort_arg = request.args.getlist("sort") if len(request.args.getlist("sort")) > 1 else request.args.get("sort")
         stmt = apply_sorting(
             stmt, model, builder.sort_fields, builder.raw_sort,
-            request.args.get("sort"), request.args.get("order")
+            sort_arg, request.args.get("order"),
+            default_sort=builder.default_sort_field,
+            default_order=builder.sort_order,
         )
 
         # Parse ?include= and ?exclude=

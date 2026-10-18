@@ -45,7 +45,9 @@ class ApiProvider:
         filter_types: Optional[Dict[str, Callable]] = None,
         sort_fields: Optional[List[str]] = None,
         sort_field: Optional[str] = None,
+        default_sort_field: Optional[str] = None,
         sort_order: Optional[str] = "asc",
+        default_sort_order: Optional[str] = None,
         raw_sort: bool = False,
         search_fields: Optional[List[str]] = None,
         request_view_args: Optional[Dict[str, str]] = None,
@@ -105,7 +107,10 @@ class ApiProvider:
         self.filter_fields = list(filter_fields or [])
         self.filter_types = dict(filter_types or {})
         self.sort_fields = list(sort_fields or ([sort_field] if sort_field else []))
-        self.sort_order = sort_order or "asc"
+        self.default_sort_field = default_sort_field or sort_field or (self.sort_fields[0] if self.sort_fields else None)
+        if self.default_sort_field and self.default_sort_field not in self.sort_fields:
+            self.sort_fields.insert(0, self.default_sort_field)
+        self.sort_order = default_sort_order or sort_order or "asc"
         self.raw_sort = raw_sort
         self.search_fields = list(search_fields or [])
 
