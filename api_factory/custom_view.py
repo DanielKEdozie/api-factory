@@ -29,6 +29,8 @@ def create_resource_view(
     model: Optional[Any] = None,
     pk_name: str = "id",
     db_session: Optional[Any] = None,
+    builder: Optional[Any] = None,
+    ctx: Optional[Any] = None,
     decorators: Optional[List[Callable]] = None,
     endpoint: Optional[str] = None,
     envelope: Optional[str] = None,
@@ -36,26 +38,33 @@ def create_resource_view(
 ):
     """Registers a custom resource view (function or Class-Based View) on a Flask App or Blueprint.
 
-    Supports signature-based dependency injection:
-      - 'data': validated request JSON (or raw JSON if validation skipped)
-      - 'schema': instantiated Marshmallow Schema
-      - 'item': resolved model instance (when detail=True)
-      - 'value' / 'values': ContextValues container
+    Supports:
+      - Automatic view name resolution: pass view=OrderView or view=OrderView.as_view('orders')
+      - Injected builder context ('ctx' / 'builder') into functions and MethodView instances
+      - Signature-based parameter injection:
+          * 'data': validated request JSON (or raw JSON if validation skipped)
+          * 'schema': instantiated Marshmallow Schema
+          * 'item': resolved model instance (when detail=True)
+          * 'ctx' / 'builder' / 'resource': ResourceBuilder instance and configuration
+          * 'value' / 'values': ContextValues container
     """
     if validate is not None and schema_validation is None:
         schema_validation = validate
 
     actual_view = view_or_fn or fn
+    context_obj = builder or ctx
 
     def register_endpoint(handler_callable: Any):
-        # Determine if handler is a Class-Based View (inherits View / MethodView)
-        is_cbv = isinstance(handler_callable, type) and issubclass(handler_callable, View)
+        # Determine if handler is a Class-Based View class or already an as_view wrapper
+        is_cbv_class = isinstance(handler_callable, type) and issubclass(handler_callable, View)
+        has_view_class = hasattr(handler_callable, "view_class")
 
-        ep = endpoint or (
-            f"{handler_callable.__name__.lower()}_{rule.strip('/').replace('/', '_')}"
-            if hasattr(handler_callable, "__name__")
-            else f"custom_{rule.strip('/').replace('/', '_')}"
-        )
+        ep = endpoint or getattr(handler_callable, "__name__", None)
+        if not ep or ep == "<lambda>":
+            if hasattr(handler_callable, "__name__"):
+                ep = f"{handler_callable.__name__.lower()}_{rule.strip('/').replace('/', '_')}"
+            else:
+                ep = f"custom_{rule.strip('/').replace('/', '_')}"
 
         # Instantiate schema if provided (or default_schema)
         active_schema = schema if schema is not None else default_schema
@@ -63,10 +72,21 @@ def create_resource_view(
         if active_schema is not None:
             schema_instance = active_schema() if isinstance(active_schema, type) else active_schema
 
-        if is_cbv:
-            # Attach schema to class so CBVs can access self.schema
+        if is_cbv_class:
+            # Auto-resolve view name: attach context to class and call .as_view(ep)
             setattr(handler_callable, "schema", schema_instance)
+            setattr(handler_callable, "ctx", context_obj)
+            setattr(handler_callable, "builder", context_obj)
+            setattr(handler_callable, "model", model)
             view_func = handler_callable.as_view(ep)
+        elif has_view_class:
+            # Already called .as_view(...): attach context to underlying view_class
+            view_cls = handler_callable.view_class
+            setattr(view_cls, "schema", schema_instance)
+            setattr(view_cls, "ctx", context_obj)
+            setattr(view_cls, "builder", context_obj)
+            setattr(view_cls, "model", model)
+            view_func = handler_callable
         else:
             view_func = handler_callable
 
@@ -93,17 +113,30 @@ def create_resource_view(
             # If detail=True and model is known, resolve item
             item = None
             if detail and model is not None:
-                pk_val = view_kwargs.get(pk_name)
+                pk_val = (
+                    view_kwargs.get(pk_name)
+                    or (view_kwargs.get(f"{model.__name__.lower()}_{pk_name}") if model else None)
+                    or (view_kwargs.get(f"{model.__name__.lower()}_id") if model else None)
+                    or view_kwargs.get("id")
+                    or view_kwargs.get("pk")
+                )
                 session = db_session
                 if session is None and hasattr(current_app, "extensions") and "sqlalchemy" in current_app.extensions:
                     session = current_app.extensions["sqlalchemy"].session
                 if session is not None and pk_val is not None:
-                    item = session.get(model, pk_val)
+                    try:
+                        if isinstance(pk_val, str) and pk_val.isdigit():
+                            item = session.get(model, int(pk_val))
+                        else:
+                            item = session.get(model, pk_val)
+                    except Exception:
+                        item = session.get(model, pk_val)
+
                     if item is None:
                         return jsonify({"error": "Not Found", "message": f"{model.__name__} {pk_val} not found"}), 404
 
             # Inspect callable parameters to inject what was requested
-            if not is_cbv and callable(view_func):
+            if not is_cbv_class and not has_view_class and callable(view_func):
                 try:
                     sig = inspect.signature(view_func)
                     params = sig.parameters
@@ -116,6 +149,14 @@ def create_resource_view(
                         call_kwargs["schema"] = schema_instance
                     if "item" in params or has_var_kwargs:
                         call_kwargs["item"] = item
+                    if model is not None and model.__name__.lower() in params:
+                        call_kwargs[model.__name__.lower()] = item
+                    if "ctx" in params or has_var_kwargs:
+                        call_kwargs["ctx"] = context_obj
+                    if "builder" in params:
+                        call_kwargs["builder"] = context_obj
+                    if "resource" in params:
+                        call_kwargs["resource"] = context_obj
                     if "value" in params or "values" in params:
                         val_ctx = ContextValues(item=item, data=validated_data)
                         if "value" in params:
@@ -142,7 +183,7 @@ def create_resource_view(
             for dec in reversed(decorators):
                 final_func = dec(final_func)
 
-        req_methods = methods or (["GET"] if not is_cbv else None)
+        req_methods = methods or (["GET"] if not (is_cbv_class or has_view_class) else None)
         target.add_url_rule(rule, endpoint=ep, view_func=final_func, methods=req_methods, **options)
         return handler_callable
 

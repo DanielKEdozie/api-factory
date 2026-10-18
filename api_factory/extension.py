@@ -77,6 +77,8 @@ class ApiFactory:
             schema_validation=schema_validation,
             validate=validate,
             db_session=self.db.session if self.db else None,
+            builder=self,
+            ctx=self,
             decorators=decorators,
             endpoint=endpoint,
             envelope=envelope,

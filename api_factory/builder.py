@@ -527,6 +527,8 @@ class ApiProvider:
         schema_validation: Optional[bool] = None,
         validate: Optional[bool] = None,
         detail: bool = False,
+        args_key: Optional[str] = None,
+        pk_name: Optional[str] = None,
         decorators: Optional[List[Callable]] = None,
         endpoint: Optional[str] = None,
         **options
@@ -534,9 +536,10 @@ class ApiProvider:
         """Registers a custom view or action scoped to this resource's route_prefix."""
         from .custom_view import create_resource_view
 
+        target_pk = args_key or pk_name or self.pk_name
         clean_path = path.lstrip("/")
         if detail:
-            pk_pattern = build_pk_route_pattern(self.pk_name, self.pk_type)
+            pk_pattern = build_pk_route_pattern(target_pk, self.pk_type)
             full_rule = f"{self.route_prefix.rstrip('/')}{pk_pattern}" + (f"/{clean_path}" if clean_path else "")
         else:
             full_rule = self.route_prefix.rstrip("/") + (f"/{clean_path}" if clean_path else "")
@@ -557,6 +560,8 @@ class ApiProvider:
             model=self.model,
             pk_name=self.pk_name,
             db_session=self._db.session if self._db else None,
+            builder=self,
+            ctx=self,
             decorators=combined_decorators,
             endpoint=endpoint or f"{self.endpoint_name}_{clean_path.replace('/', '_') or 'action'}",
             envelope=self.envelope,
