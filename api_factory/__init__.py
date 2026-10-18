@@ -8,7 +8,7 @@ from .builder import ApiProvider, ApiBuilder
 from .views import CollectionView, ItemView, SingletonView
 from .schema_builder import SchemaBuilder
 from .rate_limiter import rate_limit, RateLimitStore
-from .responses import json_response, requires_json, register_json_error_handlers
+from .responses import json_response, requires_json
 from .converters import IntOrStrConverter
 from .exporters import build_csv_response
 
@@ -28,7 +28,6 @@ __all__ = [
     "RateLimitStore",
     "json_response",
     "requires_json",
-    "register_json_error_handlers",
     "IntOrStrConverter",
     "build_csv_response",
     "ContextValues",
