@@ -29,8 +29,14 @@ def apply_soft_delete_filter(stmt: Any, model: Any, soft_delete: bool) -> Any:
     return stmt
 
 
-def apply_eager_loads(stmt: Any, model: Any, action: str, eager_loads: Optional[Dict[str, List[Tuple[str, str]]]]) -> Any:
-    """Applies declarative loader strategies for an action."""
+def apply_eager_loads(stmt: Any, model: Any, action: str, eager_loads: Any) -> Any:
+    """Applies declarative loader strategies for an action.
+    Supports:
+        - dict: {'*': [('joinedload', 'category')], 'collection': [...]}
+        - list of tuples: [('joinedload', 'category'), ('selectinload', 'images')]
+        - list of strings: ['category', 'images'] (auto-chooses joinedload for single, selectinload for collections)
+        - list of SQLAlchemy loader options: [joinedload(Model.category), selectinload(Model.images)]
+    """
     if not eager_loads:
         return stmt
 
@@ -42,24 +48,57 @@ def apply_eager_loads(stmt: Any, model: Any, action: str, eager_loads: Optional[
     }
     keys = action_aliases.get(action, [action])
 
-    strategies = []
-    if "*" in eager_loads:
-        strategies.extend(eager_loads["*"])
+    items = []
+    if isinstance(eager_loads, dict):
+        if "*" in eager_loads:
+            items.extend(eager_loads["*"])
+        for k in keys:
+            if k in eager_loads:
+                items.extend(eager_loads[k])
+                break
+    elif isinstance(eager_loads, (list, tuple, set)):
+        items = list(eager_loads)
 
-    for k in keys:
-        if k in eager_loads:
-            strategies.extend(eager_loads[k])
-            break
+    from sqlalchemy import inspect as sqla_inspect
+    mapper = None
+    try:
+        mapper = sqla_inspect(model)
+    except Exception:
+        pass
 
-    for strat_name, attr_name in strategies:
-        loader = LOAD_STRATEGIES.get(strat_name.lower())
-        if loader is None:
-            log.warning("Unknown eager load strategy: %s for %s", strat_name, attr_name)
+    for item in items:
+        # Case 1: Raw SQLAlchemy loader option already constructed (e.g. db.joinedload(Model.category))
+        if hasattr(item, "_is_core") or hasattr(item, "is_core") or hasattr(item, "path") or hasattr(item, "propagate_to_loaders") or "Load" in type(item).__name__:
+            stmt = stmt.options(item)
             continue
-        if not hasattr(model, attr_name):
-            log.warning("Model %s has no attribute %s for eager loading", model.__name__, attr_name)
+
+        # Case 2: Tuple (strat_name, attr_name)
+        if isinstance(item, (tuple, list)) and len(item) == 2:
+            strat_name, attr_name = item
+            loader = LOAD_STRATEGIES.get(str(strat_name).lower(), selectinload)
+            if hasattr(model, str(attr_name)):
+                stmt = stmt.options(loader(getattr(model, str(attr_name))))
             continue
-        stmt = stmt.options(loader(getattr(model, attr_name)))
+
+        # Case 3: String name of relationship (e.g. 'category', 'images')
+        if isinstance(item, str) and hasattr(model, item):
+            col = getattr(model, item)
+            loader = selectinload
+            if mapper and item in mapper.relationships:
+                rel = mapper.relationships[item]
+                if not rel.uselist:
+                    loader = joinedload
+            stmt = stmt.options(loader(col))
+            continue
+
+        # Case 4: SQLAlchemy attribute directly passed (e.g. Equipment.category)
+        if hasattr(item, "property"):
+            loader = selectinload
+            if hasattr(item.property, "uselist") and not item.property.uselist:
+                loader = joinedload
+            stmt = stmt.options(loader(item))
+            continue
+
     return stmt
 
 

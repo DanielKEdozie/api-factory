@@ -131,7 +131,10 @@ class ApiProvider:
 
         # Rate limiting and eager loading
         self.rate_limits = dict(rate_limits or {})
-        self.eager_loads = dict(eager_loads or {})
+        if eager_loads is not None and not isinstance(eager_loads, dict):
+            self.eager_loads = {"*": list(eager_loads)}
+        else:
+            self.eager_loads = dict(eager_loads or {})
         self.export_fields = list(export_fields or [])
         self.soft_delete = soft_delete
         self.audit = audit
