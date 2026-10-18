@@ -191,6 +191,9 @@ class ApiFactory:
             app.extensions = {}
         app.extensions["api_factory"] = self
 
+        from .schema_builder import set_default_factory
+        set_default_factory(self)
+
         if self.docs_config.get("enabled"):
             self.register_docs(app)
 
