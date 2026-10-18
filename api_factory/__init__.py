@@ -14,6 +14,12 @@ from .exporters import build_csv_response
 
 from .context import ContextValues
 from .custom_view import create_resource_view, ResourceContext
+from .openapi import (
+    generate_openapi_spec,
+    get_swagger_ui_html,
+    get_redoc_html,
+    get_scalar_html,
+)
 
 __version__ = "1.0.0"
 
@@ -34,4 +40,8 @@ __all__ = [
     "ContextValues",
     "create_resource_view",
     "ResourceContext",
+    "generate_openapi_spec",
+    "get_swagger_ui_html",
+    "get_redoc_html",
+    "get_scalar_html",
 ]

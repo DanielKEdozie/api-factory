@@ -76,15 +76,22 @@ class ApiProvider:
         exclude_routes: Optional[List[str]] = None,
         include_routes: Optional[List[str]] = None,
         related_models: Optional[List[Tuple[Any, str]]] = None,
+        docs: Optional[Union[Dict[str, Any], str]] = None,
+        factory: Optional[Any] = None,
     ):
         self.app_or_bp = app_or_bp
         self.model = model
+        self.factory = factory
+        self.docs = self._normalize_docs(docs)
+        self.actions: List[Dict[str, Any]] = []
+        self.methods = list(methods or ["GET", "POST", "PUT", "PATCH", "DELETE"])
         if schema is None:
             sb = SchemaBuilder(model)
             self.schema = sb.schema() if hasattr(sb, "schema") and isinstance(sb.schema, type) else sb()
         else:
             self.schema = schema() if isinstance(schema, type) else schema
         self._db = db
+        self.envelope = envelope
 
         # Endpoint naming & route prefixing
         self.endpoint_name = endpoint_name or endpoint or resource_name or model.__tablename__
@@ -202,6 +209,18 @@ class ApiProvider:
                     normalized[k] = action_list
             return normalized
         return {}
+
+    def _normalize_docs(self, docs: Optional[Union[Dict[str, Any], str]]) -> Dict[str, Any]:
+        default_tag = self.model.__name__ if hasattr(self.model, "__name__") else str(self.endpoint_name).capitalize()
+        default_desc = getattr(self.model, "__doc__", "") or f"CRUD operations for {default_tag}."
+        if isinstance(docs, str):
+            return {"tag": default_tag, "description": docs}
+        elif isinstance(docs, dict):
+            res = dict(docs)
+            res.setdefault("tag", default_tag)
+            res.setdefault("description", default_desc)
+            return res
+        return {"tag": default_tag, "description": default_desc}
 
     def _apply_envelope(self):
         if self.envelope:
@@ -529,6 +548,7 @@ class ApiProvider:
         detail: bool = False,
         args_key: Optional[str] = None,
         pk_name: Optional[str] = None,
+        docs: Optional[Union[Dict[str, Any], str]] = None,
         decorators: Optional[List[Callable]] = None,
         endpoint: Optional[str] = None,
         **options
@@ -545,6 +565,17 @@ class ApiProvider:
             full_rule = self.route_prefix.rstrip("/") + (f"/{clean_path}" if clean_path else "")
 
         combined_decorators = list(decorators or [])
+        ep_name = endpoint or f"{self.endpoint_name}_{clean_path.replace('/', '_') or 'action'}"
+        req_methods = [m.upper() for m in (methods or ["GET"])]
+
+        self.actions.append({
+            "rule": full_rule,
+            "methods": req_methods,
+            "schema": schema,
+            "docs": docs,
+            "detail": detail,
+            "endpoint": ep_name,
+        })
 
         return create_resource_view(
             target=self.app_or_bp,
@@ -659,7 +690,7 @@ class ApiProvider:
 
         endpoint_name = kwargs.pop("endpoint_name", f"{self.endpoint_name}_{sub_path.strip('/').replace('-', '_')}")
 
-        return ApiProvider(
+        child = ApiProvider(
             self.app_or_bp,
             model=model,
             schema=schema,
@@ -669,8 +700,12 @@ class ApiProvider:
             request_view_args=request_view_args,
             resolve_keys=view_resolvers,
             resolve_value=target_resolve_value,
+            factory=self.factory,
             **kwargs
         )
+        if self.factory is not None and hasattr(self.factory, "resources"):
+            self.factory.resources.append(child)
+        return child
 
     # Backward-compatible alias
     register_nested = sub_resource
