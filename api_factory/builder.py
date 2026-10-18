@@ -517,6 +517,54 @@ class ApiProvider:
         """Register a custom route under this API's route_prefix."""
         return self.route(rule, **options)(view_func)
 
+    def resource_view(
+        self,
+        path: str = "",
+        view: Optional[Any] = None,
+        fn: Optional[Callable] = None,
+        methods: Optional[List[str]] = None,
+        schema: Optional[Any] = None,
+        schema_validation: Optional[bool] = None,
+        validate: Optional[bool] = None,
+        detail: bool = False,
+        decorators: Optional[List[Callable]] = None,
+        endpoint: Optional[str] = None,
+        **options
+    ):
+        """Registers a custom view or action scoped to this resource's route_prefix."""
+        from .custom_view import create_resource_view
+
+        clean_path = path.lstrip("/")
+        if detail:
+            pk_pattern = build_pk_route_pattern(self.pk_name, self.pk_type)
+            full_rule = f"{self.route_prefix.rstrip('/')}{pk_pattern}" + (f"/{clean_path}" if clean_path else "")
+        else:
+            full_rule = self.route_prefix.rstrip("/") + (f"/{clean_path}" if clean_path else "")
+
+        combined_decorators = list(decorators or [])
+
+        return create_resource_view(
+            target=self.app_or_bp,
+            rule=full_rule,
+            view_or_fn=view,
+            fn=fn,
+            methods=methods,
+            schema=schema,
+            default_schema=self.schema,
+            schema_validation=schema_validation,
+            validate=validate,
+            detail=detail,
+            model=self.model,
+            pk_name=self.pk_name,
+            db_session=self._db.session if self._db else None,
+            decorators=combined_decorators,
+            endpoint=endpoint or f"{self.endpoint_name}_{clean_path.replace('/', '_') or 'action'}",
+            envelope=self.envelope,
+            **options
+        )
+
+    action = resource_view
+
     def override_action(self, action: str):
         """Decorator to override a built-in CRUD action (list, get_one, create, update, delete)."""
         def decorator(f):
