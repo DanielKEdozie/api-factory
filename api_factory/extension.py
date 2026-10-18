@@ -1,4 +1,5 @@
 from .converters import register_converters
+from .responses import register_json_error_handlers
 
 
 class ApiFactory:
@@ -20,8 +21,9 @@ class ApiFactory:
         if ma is not None:
             self.ma = ma
 
-        # Register int_or_str converter automatically on the app
+        # Register int_or_str converter and JSON error handlers automatically on the app
         register_converters(app)
+        register_json_error_handlers(app)
 
         if not hasattr(app, "extensions"):
             app.extensions = {}
@@ -34,6 +36,8 @@ class ApiFactory:
         target = blueprint or app or self.app
         if target is None:
             raise ValueError("A blueprint or app must be provided to create_resource()")
+
+        register_json_error_handlers(target)
 
         if "db" not in kwargs and self.db is not None:
             kwargs["db"] = self.db

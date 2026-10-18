@@ -1,4 +1,5 @@
 from functools import wraps
+from typing import Any
 from flask import g, jsonify, make_response, request, Response
 from werkzeug.exceptions import BadRequest
 
@@ -54,3 +55,25 @@ def json_response(default_status: int = 200, envelope: str | None = None):
 
         return decorated
     return decorator
+
+
+def register_json_error_handlers(app_or_bp: Any):
+    """Registers standard JSON error handlers on a Flask App or Blueprint so all HTTP
+    exceptions (400 validation, 404 not found, 405, 500) return consistent JSON responses.
+    """
+    from werkzeug.exceptions import HTTPException
+
+    if hasattr(app_or_bp, "errorhandler"):
+        @app_or_bp.errorhandler(HTTPException)
+        def handle_http_exception(e):
+            code = e.code or 500
+            payload = {
+                "error": e.name,
+                "message": e.description,
+                "code": code,
+            }
+            env_key = getattr(g, "envelope_key", None)
+            if env_key:
+                payload["status"] = "error"
+            return make_response(jsonify(payload), code)
+

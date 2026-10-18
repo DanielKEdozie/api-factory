@@ -5,7 +5,7 @@ from flask import abort, current_app, g, has_app_context, request
 from sqlalchemy import select
 from .converters import build_pk_route_pattern, register_converters
 from .rate_limiter import resolve_rate_limit_decorator
-from .responses import json_response
+from .responses import json_response, register_json_error_handlers
 from .schema_builder import SchemaBuilder
 from .views import CollectionView, ItemView, SingletonView
 
@@ -327,6 +327,7 @@ class ApiProvider:
     def _register_routes(self):
         """Constructs and binds MethodViews to the Flask application or Blueprint."""
         register_converters(self.app_or_bp)
+        register_json_error_handlers(self.app_or_bp)
 
         if self.singleton:
             self._register_singleton_routes()
