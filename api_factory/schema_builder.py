@@ -108,12 +108,6 @@ class SchemaBuilder:
 
         if ma is None and factory is not None:
             ma = getattr(factory, "ma", None)
-        if ma is None:
-            try:
-                from app.extensions import ma as _app_ma
-                ma = _app_ma
-            except Exception:
-                pass
 
         # flask_api_builder raises when it cannot resolve a session, which used
         # to push every schema onto the degraded marshmallow_sqlalchemy fallback
@@ -122,12 +116,6 @@ class SchemaBuilder:
             db = getattr(factory, "db", None)
             if db is not None:
                 sqla_session = getattr(db, "session", None)
-        if sqla_session is None:
-            try:
-                from app.extensions import db as _app_db
-                sqla_session = _app_db.session
-            except Exception:
-                pass
 
         # 1. Try flask_api_builder's SchemaBuilder if ma is available or configured
         try:
