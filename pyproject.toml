@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "api-factory"
+version = "1.0.0"
+description = "A modular, extensible Flask REST API factory with MethodViews, automated schemas, rate limiting, and eager loading."
+readme = "README.md"
+authors = [{ name = "MachineYard Team" }]
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "Flask>=2.0.0",
+    "SQLAlchemy>=2.0.0",
+    "marshmallow>=3.0.0",
+    "marshmallow-sqlalchemy>=0.28.0"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["api_factory*"]
