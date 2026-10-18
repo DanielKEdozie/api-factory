@@ -23,17 +23,24 @@ class ApiFactory:
         description: str = "RESTful API powered by api-factory",
         error_schema: Optional[Any] = None,
         error_schemas: Optional[Dict[Union[int, str], Any]] = None,
+        error_response: Optional[Dict[Any, Any]] = None,
+        error_responses: Optional[Dict[Any, Any]] = None,
     ):
         self.app = app
         self.db = db
         self.ma = ma
         self.resources: List[Any] = []
         self.custom_views: List[Dict[str, Any]] = []
+        self.error_handlers: Dict[Any, Dict[str, Any]] = {}
 
         self.error_schema = error_schema
         self.error_schemas: Dict[Union[int, str], Any] = dict(error_schemas or {})
         if error_schema and "default" not in self.error_schemas:
             self.error_schemas["default"] = error_schema
+
+        raw_err_resp = error_response if error_response is not None else error_responses
+        if raw_err_resp:
+            self._process_error_responses(app, raw_err_resp)
 
         providers = []
         if isinstance(docs, (list, tuple, set)):
@@ -58,6 +65,65 @@ class ApiFactory:
         if app is not None:
             self.init_app(app, db=db, ma=ma)
 
+    def _process_error_responses(self, app, error_dict: dict):
+        """Processes error_response configuration:
+        - Resolves keys: int status codes (404, 500), HTTPException classes (NotFound, etc.), or ValidationError
+        - Resolves values: Schema classes/instances, callbacks, or {"schema": ..., "callback": ...}
+        - Registers runtime error handlers on Flask app if a callback is provided
+        - Registers OpenAPI schemas in self.error_schemas for automatic documentation
+        """
+        if not error_dict or not isinstance(error_dict, dict):
+            return
+
+        for key, val in error_dict.items():
+            code = None
+            target = key
+
+            # Resolve key
+            if isinstance(key, int):
+                code = key
+                target = key
+            elif isinstance(key, str) and key.isdigit():
+                code = int(key)
+                target = int(key)
+            elif isinstance(key, type):
+                target = key
+                if hasattr(key, "code") and isinstance(key.code, int):
+                    code = key.code
+                elif key.__name__ == "ValidationError" or "validation" in key.__name__.lower():
+                    code = 400
+                else:
+                    code = getattr(key, "code", 500)
+
+            # Resolve value (Schema vs callback vs dict/tuple)
+            handler = None
+            schema = None
+
+            if isinstance(val, dict):
+                handler = val.get("callback") or val.get("handler")
+                schema = val.get("schema")
+            elif isinstance(val, (tuple, list)) and len(val) == 2:
+                if callable(val[0]) and not (isinstance(val[0], type) and hasattr(val[0], "_declared_fields")):
+                    handler, schema = val[0], val[1]
+                else:
+                    schema, handler = val[0], val[1]
+            elif callable(val) and not (isinstance(val, type) and hasattr(val, "_declared_fields")):
+                handler = val
+                schema = getattr(val, "schema", None) or getattr(val, "_schema", None)
+            else:
+                schema = val
+
+            # Register runtime error handler on app if callback given
+            if handler is not None and app is not None:
+                app.register_error_handler(target, handler)
+
+            # Register schema for OpenAPI documentation
+            if schema is not None and code is not None:
+                self.error_schemas[code] = schema
+
+            if handler is not None and code is not None:
+                self.error_handlers[code] = {"handler": handler, "schema": schema, "target": target}
+
     def init_app(
         self,
         app,
@@ -73,6 +139,8 @@ class ApiFactory:
         openapi_url: Optional[str] = None,
         error_schema: Optional[Any] = None,
         error_schemas: Optional[Dict[Union[int, str], Any]] = None,
+        error_response: Optional[Dict[Any, Any]] = None,
+        error_responses: Optional[Dict[Any, Any]] = None,
     ):
         self.app = app
         if db is not None:
@@ -85,6 +153,10 @@ class ApiFactory:
             self.error_schemas["default"] = error_schema
         if error_schemas is not None:
             self.error_schemas.update(error_schemas)
+
+        raw_err_resp = error_response if error_response is not None else error_responses
+        if raw_err_resp:
+            self._process_error_responses(app, raw_err_resp)
 
         if docs is not None:
             providers = []
