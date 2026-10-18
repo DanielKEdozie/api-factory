@@ -2,7 +2,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 import json
 import math
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 import uuid
 from flask import abort, current_app, g, request
 from flask.views import MethodView
@@ -18,8 +18,50 @@ from .querying import (
     apply_search,
     apply_soft_delete_filter,
     apply_sorting,
+    configured_eager_load_names,
 )
-from .responses import json_response, requires_json
+
+
+def _apply_include_eager_loads(stmt: Any, model: Any, include_fields: list[str], builder: Any, action: str) -> Any:
+    """Eager-load relationships named in ``?include=`` that ``eager_loads`` does not already cover.
+
+    Re-declaring a relationship that the resource already eager-loads raises
+    ``InvalidRequestError`` because SQLAlchemy refuses conflicting loader
+    strategies for the same relationship, so those names are skipped.
+    """
+    if not include_fields:
+        return stmt
+    try:
+        mapper = sqla_inspect(model)
+    except Exception:
+        return stmt
+
+    already_loaded = configured_eager_load_names(builder.eager_loads, action)
+    for field in include_fields:
+        if field in already_loaded or field not in mapper.relationships:
+            continue
+        stmt = stmt.options(selectinload(getattr(model, field)))
+    return stmt
+
+
+def _rows(session: Any, stmt: Any) -> list:
+    """Execute a statement returning rows, tolerating joined eager loads.
+
+    SQLAlchemy raises ``InvalidRequestError`` unless ``unique()`` is applied when
+    a ``joinedload`` targets a to-many relationship, because the join duplicates
+    the parent row. ``unique()`` is a no-op for the other loader strategies, so
+    it is applied unconditionally.
+    """
+    return session.execute(stmt).unique().scalars().all()
+
+
+def _first_row(session: Any, stmt: Any) -> Any:
+    """Return the first row of a statement, or ``None``.
+
+    Uses ``first()`` rather than ``scalar_one_or_none()`` so a query that
+    unexpectedly matches several rows degrades to a result instead of a 500.
+    """
+    return session.execute(stmt).unique().scalars().first()
 
 
 def parse_param_list(param_val: Any) -> list[str]:
@@ -116,7 +158,6 @@ class CollectionView(MethodView):
         stmt = apply_scopes(stmt, model, builder.request_view_args, kwargs)
         stmt = apply_soft_delete_filter(stmt, model, builder.soft_delete)
         stmt = builder._apply_query_override(stmt, "collection", **kwargs)
-        stmt = apply_eager_loads(stmt, model, "collection", builder.eager_loads)
         stmt = apply_filters(stmt, model, builder.filter_fields, builder.filter_types, request.args)
         stmt = apply_search(stmt, model, builder.search_fields, request.args.get("q"))
         sort_arg = request.args.getlist("sort") if len(request.args.getlist("sort")) > 1 else request.args.get("sort")
@@ -127,23 +168,22 @@ class CollectionView(MethodView):
             default_order=builder.sort_order,
         )
 
+        # Snapshot before eager loading: a joinedload against a to-many relationship
+        # multiplies rows in the FROM clause and would inflate the pagination total.
+        count_stmt = stmt.order_by(None)
+
+        stmt = apply_eager_loads(stmt, model, "collection", builder.eager_loads)
+
         # Parse ?include= and ?exclude=
         include_fields = parse_param_list(request.args.get("include"))
         exclude_fields = parse_param_list(request.args.get("exclude"))
 
         # Automatically eager-load any relationship in include_fields
-        for field in include_fields:
-            if hasattr(model, field):
-                try:
-                    mapper = sqla_inspect(model)
-                    if field in mapper.relationships:
-                        stmt = stmt.options(selectinload(getattr(model, field)))
-                except Exception:
-                    pass
+        stmt = _apply_include_eager_loads(stmt, model, include_fields, builder, "collection")
 
         # Check for CSV export request (?export=csv)
         if request.args.get("export", "").lower() == "csv":
-            rows = session.execute(stmt).scalars().all()
+            rows = _rows(session, stmt)
             raw_serialized = builder.schema.dump(rows, many=True)
             if include_fields or exclude_fields:
                 serialized = [
@@ -162,7 +202,7 @@ class CollectionView(MethodView):
 
         # Handle unpaginated list
         if not builder.paginate or disable_pagination:
-            rows = session.execute(stmt).scalars().all()
+            rows = _rows(session, stmt)
             raw_serialized = builder.schema.dump(rows, many=True)
             if include_fields or exclude_fields:
                 serialized = [
@@ -185,11 +225,11 @@ class CollectionView(MethodView):
             per_page_val = builder.page_size
         per_page = min(max(per_page_val, 1), builder.max_page_size)
 
-        total_stmt = select(func.count()).select_from(stmt.subquery())
+        total_stmt = select(func.count()).select_from(count_stmt.subquery())
         total = session.execute(total_stmt).scalar() or 0
 
         paged_stmt = stmt.limit(per_page).offset((page - 1) * per_page)
-        rows = session.execute(paged_stmt).scalars().all()
+        rows = _rows(session, paged_stmt)
         raw_serialized = builder.schema.dump(rows, many=True)
         if include_fields or exclude_fields:
             serialized = [
@@ -246,10 +286,10 @@ class CollectionView(MethodView):
         except ValidationError as exc:
             session.rollback()
             abort(400, description=exc.messages)
-        except Exception as exc:
+        except Exception:
             session.rollback()
             current_app.logger.exception("Error creating resource in %s", builder.endpoint_name)
-            abort(400, description=str(exc))
+            raise
 
 
 class ItemView(MethodView):
@@ -300,18 +340,9 @@ class ItemView(MethodView):
         stmt = apply_soft_delete_filter(stmt, model, builder.soft_delete)
         stmt = builder._apply_query_override(stmt, action, **view_kwargs)
         stmt = apply_eager_loads(stmt, model, action, builder.eager_loads)
+        stmt = _apply_include_eager_loads(stmt, model, include_fields or [], builder, action)
 
-        if include_fields:
-            for field in include_fields:
-                if hasattr(model, field):
-                    try:
-                        mapper = sqla_inspect(model)
-                        if field in mapper.relationships:
-                            stmt = stmt.options(selectinload(getattr(model, field)))
-                    except Exception:
-                        pass
-
-        item = session.execute(stmt).scalar_one_or_none()
+        item = _first_row(session, stmt)
         if item is None:
             abort(404, description=f"{model.__name__} not found")
         return item
@@ -368,10 +399,10 @@ class ItemView(MethodView):
         except ValidationError as exc:
             session.rollback()
             abort(400, description=exc.messages)
-        except Exception as exc:
+        except Exception:
             session.rollback()
             current_app.logger.exception("Error updating resource in %s", builder.endpoint_name)
-            abort(400, description=str(exc))
+            raise
 
     def delete(self, **kwargs):
         builder = self.builder
@@ -398,10 +429,10 @@ class ItemView(MethodView):
             session.commit()
             builder._invoke_hook(builder.after_delete, item, values=values)
             return "", 204
-        except Exception as exc:
+        except Exception:
             session.rollback()
             current_app.logger.exception("Error deleting resource in %s", builder.endpoint_name)
-            abort(500, description="Deletion failed. Database state unchanged.")
+            raise
 
 
 class SingletonView(MethodView):
@@ -441,18 +472,9 @@ class SingletonView(MethodView):
         stmt = apply_soft_delete_filter(stmt, model, builder.soft_delete)
         stmt = builder._apply_query_override(stmt, action, **view_kwargs)
         stmt = apply_eager_loads(stmt, model, action, builder.eager_loads)
+        stmt = _apply_include_eager_loads(stmt, model, include_fields or [], builder, action)
 
-        if include_fields:
-            for field in include_fields:
-                if hasattr(model, field):
-                    try:
-                        mapper = sqla_inspect(model)
-                        if field in mapper.relationships:
-                            stmt = stmt.options(selectinload(getattr(model, field)))
-                    except Exception:
-                        pass
-
-        item = session.execute(stmt).scalar_one_or_none()
+        item = _first_row(session, stmt)
         return item
 
     def get(self, **kwargs):
@@ -544,6 +566,7 @@ class SingletonView(MethodView):
             session.commit()
             builder._invoke_hook(builder.after_delete, item, values=values)
             return "", 204
-        except Exception as exc:
+        except Exception:
             session.rollback()
-            abort(500, description=str(exc))
+            current_app.logger.exception("Error deleting resource in %s", builder.endpoint_name)
+            raise

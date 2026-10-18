@@ -1,6 +1,6 @@
 import inspect
 from functools import wraps
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, List, Optional
 from flask import current_app, g, jsonify, make_response, request, Response
 from flask.views import View
 
@@ -184,13 +184,8 @@ def create_resource_view(
                     or view_kwargs.get("pk")
                 )
                 if active_session is not None and pk_val is not None:
-                    try:
-                        if isinstance(pk_val, str) and pk_val.isdigit():
-                            item = active_session.get(active_model, int(pk_val))
-                        else:
-                            item = active_session.get(active_model, pk_val)
-                    except Exception:
-                        item = active_session.get(active_model, pk_val)
+                    lookup = int(pk_val) if isinstance(pk_val, str) and pk_val.isdigit() else pk_val
+                    item = active_session.get(active_model, lookup)
 
                     if item is None:
                         return jsonify({"error": "Not Found", "message": f"{active_model.__name__} {pk_val} not found"}), 404
@@ -222,48 +217,11 @@ def create_resource_view(
 
             # Inspect callable parameters to inject what was requested
             if not is_cbv_class and not has_view_class and callable(view_func):
-                try:
-                    sig = inspect.signature(view_func)
-                    params = sig.parameters
-                    has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-
-                    call_kwargs = dict(view_kwargs)
-                    if "data" in params or has_var_kwargs:
-                        call_kwargs["data"] = validated_data
-                    if "schema" in params or has_var_kwargs:
-                        call_kwargs["schema"] = schema_instance
-                    if "item" in params or has_var_kwargs:
-                        call_kwargs["item"] = item
-                    if active_model is not None and active_model.__name__.lower() in params:
-                        call_kwargs[active_model.__name__.lower()] = item
-                    if "ctx" in params or has_var_kwargs:
-                        call_kwargs["ctx"] = req_ctx
-                    if "builder" in params:
-                        call_kwargs["builder"] = req_ctx
-                    if "resource" in params:
-                        call_kwargs["resource"] = req_ctx
-                    if "value" in params:
-                        call_kwargs["value"] = val_ctx
-                    if "values" in params:
-                        call_kwargs["values"] = val_ctx
-                    if "parent" in params:
-                        call_kwargs["parent"] = req_ctx.parent_record
-                    if "parent_record" in params:
-                        call_kwargs["parent_record"] = req_ctx.parent_record
-                    for k, v in val_ctx.items():
-                        if k in params:
-                            call_kwargs[k] = v
-
-                    # Filter call_kwargs to only accepted parameters if no **kwargs
-                    if not has_var_kwargs:
-                        call_kwargs = {k: v for k, v in call_kwargs.items() if k in params}
-
-                    res = view_func(*view_args, **call_kwargs)
-                except Exception as exc:
-                    if "res" not in locals():
-                        res = view_func(*view_args, **view_kwargs)
-                    else:
-                        raise exc
+                call_kwargs = _build_injected_kwargs(
+                    view_func, view_kwargs, validated_data, schema_instance,
+                    item, active_model, req_ctx, val_ctx
+                )
+                res = view_func(*view_args, **call_kwargs)
             else:
                 res = view_func(*view_args, **view_kwargs)
 
@@ -285,6 +243,53 @@ def create_resource_view(
 
     # Used as a decorator: @resource_view(...)
     return register_endpoint
+
+
+def _build_injected_kwargs(
+    view_func: Callable,
+    view_kwargs: dict,
+    validated_data: Any,
+    schema_instance: Optional[Any],
+    item: Optional[Any],
+    active_model: Optional[Any],
+    req_ctx: "ResourceContext",
+    val_ctx: ContextValues,
+) -> dict:
+    """Build the keyword arguments a custom view explicitly asked for by name."""
+    sig = inspect.signature(view_func)
+    params = sig.parameters
+    has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+    call_kwargs = dict(view_kwargs)
+    if "data" in params or has_var_kwargs:
+        call_kwargs["data"] = validated_data
+    if "schema" in params or has_var_kwargs:
+        call_kwargs["schema"] = schema_instance
+    if "item" in params or has_var_kwargs:
+        call_kwargs["item"] = item
+    if active_model is not None and active_model.__name__.lower() in params:
+        call_kwargs[active_model.__name__.lower()] = item
+    if "ctx" in params or has_var_kwargs:
+        call_kwargs["ctx"] = req_ctx
+    if "builder" in params:
+        call_kwargs["builder"] = req_ctx
+    if "resource" in params:
+        call_kwargs["resource"] = req_ctx
+    if "value" in params:
+        call_kwargs["value"] = val_ctx
+    if "values" in params:
+        call_kwargs["values"] = val_ctx
+    if "parent" in params:
+        call_kwargs["parent"] = req_ctx.parent_record
+    if "parent_record" in params:
+        call_kwargs["parent_record"] = req_ctx.parent_record
+    for k, v in val_ctx.items():
+        if k in params:
+            call_kwargs[k] = v
+
+    if not has_var_kwargs:
+        call_kwargs = {k: v for k, v in call_kwargs.items() if k in params}
+    return call_kwargs
 
 
 def _format_response(res: Any, schema_instance: Optional[Any], envelope: Optional[str] = None) -> Any:
@@ -319,7 +324,6 @@ def _format_response(res: Any, schema_instance: Optional[Any], envelope: Optiona
         response = make_response(formatted_body)
     elif formatted_body is None:
         response = make_response("", status_code or 204)
-        return response
     else:
         response = make_response(str(formatted_body))
 

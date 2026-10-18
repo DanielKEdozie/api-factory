@@ -1,5 +1,4 @@
 from functools import wraps
-from typing import Any
 from flask import g, jsonify, make_response, request, Response
 from werkzeug.exceptions import BadRequest
 

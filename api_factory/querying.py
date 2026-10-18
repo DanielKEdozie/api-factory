@@ -1,4 +1,5 @@
 import logging
+import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from sqlalchemy import asc, cast, desc, func, or_, select, text, String
 from sqlalchemy.orm import joinedload, selectinload, subqueryload
@@ -10,6 +11,11 @@ LOAD_STRATEGIES: dict[str, Callable] = {
     "selectinload": selectinload,
     "subqueryload": subqueryload,
 }
+
+#: A single ``raw_sort`` term: an optionally table-qualified column name.
+#: Anything richer (functions, subqueries, operators, comments) is rejected so
+#: user input is never interpolated into SQL as free text.
+_RAW_SORT_TERM = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
 
 
 def apply_scopes(stmt: Any, model: Any, request_view_args: dict, view_kwargs: dict) -> Any:
@@ -29,6 +35,44 @@ def apply_soft_delete_filter(stmt: Any, model: Any, soft_delete: bool) -> Any:
     return stmt
 
 
+def _iter_eager_items(action: str, eager_loads: Any) -> list:
+    """Flatten the accepted ``eager_loads`` shapes into a list of declarations."""
+    action_aliases = {
+        "collection": ["collection", "get_all", "list"],
+        "get_all": ["collection", "get_all", "list"],
+        "item": ["item", "get_one", "retrieve"],
+        "get_one": ["item", "get_one", "retrieve"],
+    }
+    keys = action_aliases.get(action, [action])
+
+    if isinstance(eager_loads, dict):
+        items = list(eager_loads.get("*", []))
+        for k in keys:
+            if k in eager_loads:
+                items.extend(eager_loads[k])
+                break
+        return items
+    if isinstance(eager_loads, (list, tuple, set)):
+        return list(eager_loads)
+    return []
+
+
+def configured_eager_load_names(eager_loads: Any, action: str) -> set[str]:
+    """Return relationship attribute names already targeted by ``eager_loads``.
+
+    Declaring the same relationship twice with different strategies raises
+    ``InvalidRequestError``, so callers that add further loader options (such as
+    the ``?include=`` handling) use this to skip what is already configured.
+    """
+    names = set()
+    for item in _iter_eager_items(action, eager_loads):
+        if isinstance(item, (tuple, list)) and len(item) == 2:
+            names.add(str(item[1]))
+        elif isinstance(item, str):
+            names.add(item)
+    return names
+
+
 def apply_eager_loads(stmt: Any, model: Any, action: str, eager_loads: Any) -> Any:
     """Applies declarative loader strategies for an action.
     Supports:
@@ -40,24 +84,7 @@ def apply_eager_loads(stmt: Any, model: Any, action: str, eager_loads: Any) -> A
     if not eager_loads:
         return stmt
 
-    action_aliases = {
-        "collection": ["collection", "get_all", "list"],
-        "get_all": ["collection", "get_all", "list"],
-        "item": ["item", "get_one", "retrieve"],
-        "get_one": ["item", "get_one", "retrieve"],
-    }
-    keys = action_aliases.get(action, [action])
-
-    items = []
-    if isinstance(eager_loads, dict):
-        if "*" in eager_loads:
-            items.extend(eager_loads["*"])
-        for k in keys:
-            if k in eager_loads:
-                items.extend(eager_loads[k])
-                break
-    elif isinstance(eager_loads, (list, tuple, set)):
-        items = list(eager_loads)
+    items = _iter_eager_items(action, eager_loads)
 
     from sqlalchemy import inspect as sqla_inspect
     mapper = None
@@ -155,6 +182,20 @@ def apply_search(stmt: Any, model: Any, search_fields: Optional[List[str]], q: O
     return stmt
 
 
+def _is_safe_raw_sort(model: Any, term: str) -> bool:
+    """Return True when ``term`` is a plain (optionally qualified) model column.
+
+    ``raw_sort`` exists to allow ``?sort=table.column``, not arbitrary SQL.
+    Accepting anything else lets a caller splice subqueries or comments into
+    ``ORDER BY``, so the term is matched against a strict identifier pattern
+    and then resolved against the model before it reaches ``text()``.
+    """
+    if not term or not _RAW_SORT_TERM.match(term):
+        return False
+    attr = term.rpartition(".")[2] or term
+    return hasattr(model, attr)
+
+
 def apply_sorting(
     stmt: Any,
     model: Any,
@@ -204,11 +245,13 @@ def apply_sorting(
             clean = clean[1:].strip()
 
         if raw_sort:
-            try:
+            # Never interpolate the raw term into SQL text without validating it
+            # first -- ``?sort=`` is user input and ``text()`` is not escaped.
+            if _is_safe_raw_sort(model, clean):
                 direction = "DESC" if descending else "ASC"
                 stmt = stmt.order_by(text(f"{clean} {direction}"))
-            except Exception as exc:
-                log.warning("Invalid raw sort %s: %s", clean, exc)
+            else:
+                log.warning("Rejected unsafe raw sort term: %r", clean)
         else:
             if clean in allowed and hasattr(model, clean):
                 col = getattr(model, clean)

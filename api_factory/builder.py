@@ -1,4 +1,4 @@
-from functools import wraps
+import inspect
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from flask import abort, current_app, g, has_app_context, request
@@ -255,13 +255,13 @@ class ApiProvider:
                     model_name = getattr(ref_model, "__name__", model_name)
                     col = getattr(ref_model, ref_field)
                     stmt = select(ref_model).where(col == val)
-                    parent = session.execute(stmt).scalar_one_or_none()
+                    parent = session.execute(stmt).scalars().first()
                 elif isinstance(handler, type):  # Model class
                     ref_model = handler
                     model_name = getattr(ref_model, "__name__", model_name)
                     if hasattr(ref_model, "slug") and isinstance(val, str) and not val.isdigit():
                         stmt = select(ref_model).where(ref_model.slug == val)
-                        parent = session.execute(stmt).scalar_one_or_none()
+                        parent = session.execute(stmt).scalars().first()
                     else:
                         parent = session.get(ref_model, val)
 
@@ -304,7 +304,6 @@ class ApiProvider:
 
         if override_fn and callable(override_fn):
             # If function expects (stmt) or (query, route_values, request, builder)
-            import inspect
             sig = inspect.signature(override_fn)
             params_count = len(sig.parameters)
             if params_count == 1:
@@ -462,6 +461,11 @@ class ApiProvider:
         """Invokes a lifecycle hook function, inspecting its parameter signature to dynamically pass
         available arguments (such as 'item', 'data', 'value', 'values') while remaining 100%
         backward compatible with legacy positional signatures.
+
+        The call shape is resolved from the signature *before* invoking the hook, and the hook is
+        invoked exactly once. Previously a failing call was caught and re-issued, which ran
+        side-effecting hooks twice and silently discarded any exception they raised -- including
+        ``abort()``, letting a guard hook's rejection vanish and the write proceed.
         """
         if not hook_fn or not callable(hook_fn):
             return args[0] if args else None
@@ -469,55 +473,59 @@ class ApiProvider:
         if values is None:
             values = getattr(g, "values", None) or ContextValues()
 
-        import inspect
+        call_args, call_kwargs = self._plan_hook_call(hook_fn, args, data, values)
+        return hook_fn(*call_args, **call_kwargs)
+
+    @staticmethod
+    def _plan_hook_call(hook_fn: Callable, args: tuple, data: Any, values: Any):
+        """Decide how to call ``hook_fn`` from its signature, without executing it."""
         try:
             sig = inspect.signature(hook_fn)
-            params = list(sig.parameters.values())
-            param_names = [p.name for p in params]
-            num_params = len(params)
+        except (TypeError, ValueError):
+            return list(args), {}
 
-            has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
-            has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+        params = list(sig.parameters.values())
+        param_names = [p.name for p in params]
+        num_params = len(params)
 
-            # 1. If explicit kwargs are accepted
-            if has_varkw:
-                call_kwargs = {}
-                if data is not None and "data" not in [p.name for p in params[:len(args)]]:
-                    call_kwargs["data"] = data
-                call_kwargs["value"] = values
-                call_kwargs["values"] = values
-                return hook_fn(*args, **call_kwargs)
+        has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+        call_args = list(args)
 
-            # 2. If parameter names match named args: e.g. def hook(item, data, value):
-            if num_params > len(args):
-                if num_params == 2:
-                    second_param = param_names[1]
-                    if second_param in ("value", "values"):
-                        return hook_fn(args[0], values)
-                    elif second_param == "data" and data is not None:
-                        return hook_fn(args[0], data)
-                    elif len(args) >= 2:
-                        return hook_fn(args[0], args[1])
-                    else:
-                        return hook_fn(args[0], values)
-                elif num_params == 3:
-                    item_arg = args[0] if len(args) > 0 else None
-                    data_arg = args[1] if len(args) > 1 else data
-                    return hook_fn(item_arg, data_arg, values)
+        # 1. Hook accepts **kwargs -- hand it everything by keyword.
+        if has_varkw:
+            kwargs = {}
+            if data is not None:
+                kwargs["data"] = data
+            kwargs["value"] = values
+            kwargs["values"] = values
+            return call_args, kwargs
 
-            # 3. If accepts *args
-            if has_varargs:
-                return hook_fn(*args, values)
+        # 2. Hook wants more than we hold positionally -- fill from context.
+        if num_params > len(args):
+            if num_params == 2:
+                second_param = param_names[1]
+                if second_param in ("value", "values"):
+                    return [args[0], values], {}
+                if second_param == "data" and data is not None:
+                    return [args[0], data], {}
+                if len(args) >= 2:
+                    return [args[0], args[1]], {}
+                return [args[0], values], {}
+            if num_params == 3:
+                item_arg = args[0] if len(args) > 0 else None
+                data_arg = args[1] if len(args) > 1 else data
+                return [item_arg, data_arg, values], {}
 
-            # 4. Standard positional call matching num_params
-            if num_params == len(args):
-                return hook_fn(*args)
-            elif num_params < len(args):
-                return hook_fn(*args[:num_params])
-            else:
-                return hook_fn(*args)
-        except Exception:
-            return hook_fn(*args)
+        # 3. Hook accepts *args -- append the context container.
+        if has_varargs:
+            return call_args + [values], {}
+
+        # 4. Truncate to what the hook can accept.
+        if num_params < len(args):
+            return call_args[:num_params], {}
+
+        return call_args, {}
 
     def get_list_context(self, items: list, total: int, **kwargs) -> dict:
         return {}
