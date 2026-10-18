@@ -167,6 +167,77 @@ def generate_openapi_spec(
     components = spec["components"]["schemas"]
     paths = spec["paths"]
 
+    # Extract error schemas from factory initialization
+    factory_error_schemas = dict(getattr(factory, "error_schemas", {}) or {})
+    default_err_schema = getattr(factory, "error_schema", None) or factory_error_schemas.get("default")
+
+    # Discover error schemas attached to Blueprint or App error handlers (handler.schema)
+    target_apps = []
+    if getattr(factory, "app", None):
+        target_apps.append(factory.app)
+    for res in getattr(factory, "resources", []):
+        bp = getattr(res, "app_or_bp", None)
+        if bp and bp not in target_apps:
+            target_apps.append(bp)
+
+    for target in target_apps:
+        err_spec = getattr(target, "error_handler_spec", {})
+        for bp_key, code_map in err_spec.items():
+            if isinstance(code_map, dict):
+                for sub_k, sub_v in code_map.items():
+                    if callable(sub_v):
+                        schema = getattr(sub_v, "schema", None) or getattr(sub_v, "_schema", None)
+                        code = sub_k if isinstance(sub_k, int) else getattr(sub_k, "code", None)
+                        if schema and code:
+                            factory_error_schemas.setdefault(code, schema)
+                    elif isinstance(sub_v, dict):
+                        for exc_cls, handler in sub_v.items():
+                            schema = getattr(handler, "schema", None) or getattr(handler, "_schema", None)
+                            code = sub_k if isinstance(sub_k, int) else (getattr(exc_cls, "code", None) or getattr(sub_k, "code", None))
+                            if schema and code:
+                                factory_error_schemas.setdefault(code, schema)
+
+    # Process default error schema
+    if default_err_schema:
+        d_dict = schema_to_openapi(default_err_schema)
+        spec["components"]["schemas"]["ErrorResponse"] = d_dict
+        spec["components"]["responses"]["DefaultError"] = {
+            "description": "Standard API error response",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}
+        }
+        spec["components"]["responses"]["NotFound"]["content"]["application/json"]["schema"] = {"$ref": "#/components/schemas/ErrorResponse"}
+        spec["components"]["responses"]["ValidationError"]["content"]["application/json"]["schema"] = {"$ref": "#/components/schemas/ErrorResponse"}
+
+    # Process explicit error status codes (e.g. 400, 401, 403, 404, 422, 500)
+    for code, err_schema in list(factory_error_schemas.items()):
+        if str(code) == "default":
+            continue
+        code_str = str(code)
+        c_name = f"Error_{code_str}"
+        c_dict = schema_to_openapi(err_schema)
+        spec["components"]["schemas"][c_name] = c_dict
+        spec["components"]["responses"][f"Error{code_str}"] = {
+            "description": f"HTTP {code_str} error response",
+            "content": {"application/json": {"schema": {"$ref": f"#/components/schemas/{c_name}"}}}
+        }
+        if code_str == "400":
+            spec["components"]["responses"]["ValidationError"] = {
+                "description": "Validation error response",
+                "content": {"application/json": {"schema": {"$ref": f"#/components/schemas/{c_name}"}}}
+            }
+        elif code_str == "404":
+            spec["components"]["responses"]["NotFound"] = {
+                "description": "Resource not found response",
+                "content": {"application/json": {"schema": {"$ref": f"#/components/schemas/{c_name}"}}}
+            }
+
+    # Helper to append common errors (e.g. 500, 401) to operations if defined
+    extra_error_refs = {}
+    for code_val in (401, 403, 422, 500):
+        code_str = str(code_val)
+        if f"Error{code_str}" in spec["components"]["responses"]:
+            extra_error_refs[code_str] = {"$ref": f"#/components/responses/Error{code_str}"}
+
     for resource in getattr(factory, "resources", []):
         model_name = resource.model.__name__ if hasattr(resource.model, "__name__") else "Resource"
         docs = getattr(resource, "docs", {})
@@ -477,6 +548,15 @@ def generate_openapi_spec(
                     "content": {"application/json": {"schema": {"$ref": f"#/components/schemas/{c_schema_name}"}}}
                 }
             p_item[m_lower] = op
+
+    # Ensure extra error responses (e.g. 500, 401, 403, 422) appear in all operations
+    if extra_error_refs:
+        for path_key, path_obj in paths.items():
+            for method_key, op_obj in path_obj.items():
+                if isinstance(op_obj, dict) and "responses" in op_obj:
+                    for err_code, ref_data in extra_error_refs.items():
+                        if err_code not in op_obj["responses"]:
+                            op_obj["responses"][err_code] = ref_data
 
     return spec
 

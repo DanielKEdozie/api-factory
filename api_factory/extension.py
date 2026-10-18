@@ -21,12 +21,19 @@ class ApiFactory:
         title: str = "API Documentation",
         version: str = "1.0.0",
         description: str = "RESTful API powered by api-factory",
+        error_schema: Optional[Any] = None,
+        error_schemas: Optional[Dict[Union[int, str], Any]] = None,
     ):
         self.app = app
         self.db = db
         self.ma = ma
         self.resources: List[Any] = []
         self.custom_views: List[Dict[str, Any]] = []
+
+        self.error_schema = error_schema
+        self.error_schemas: Dict[Union[int, str], Any] = dict(error_schemas or {})
+        if error_schema and "default" not in self.error_schemas:
+            self.error_schemas["default"] = error_schema
 
         providers = []
         if isinstance(docs, (list, tuple, set)):
@@ -64,12 +71,20 @@ class ApiFactory:
         redoc_url: Optional[str] = None,
         scalar_url: Optional[str] = None,
         openapi_url: Optional[str] = None,
+        error_schema: Optional[Any] = None,
+        error_schemas: Optional[Dict[Union[int, str], Any]] = None,
     ):
         self.app = app
         if db is not None:
             self.db = db
         if ma is not None:
             self.ma = ma
+
+        if error_schema is not None:
+            self.error_schema = error_schema
+            self.error_schemas["default"] = error_schema
+        if error_schemas is not None:
+            self.error_schemas.update(error_schemas)
 
         if docs is not None:
             providers = []
