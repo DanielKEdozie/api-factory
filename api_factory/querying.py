@@ -1,7 +1,8 @@
 import logging
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from sqlalchemy import asc, cast, desc, func, or_, select, text, String
+from sqlalchemy import asc, cast, desc, false, func, or_, select, text, String
+from sqlalchemy import Boolean, Float, Integer, Numeric
 from sqlalchemy.orm import joinedload, selectinload, subqueryload
 
 log = logging.getLogger(__name__)
@@ -129,6 +130,48 @@ def apply_eager_loads(stmt: Any, model: Any, action: str, eager_loads: Any) -> A
     return stmt
 
 
+#: Spellings a query string may use for booleans. Query strings have no type,
+#: and a JS client sends `true`/`false` which arrives here as the text
+#: "true"/"false".
+_TRUE_STRINGS = frozenset({"true", "t", "yes", "y", "on", "1"})
+_FALSE_STRINGS = frozenset({"false", "f", "no", "n", "off", "0"})
+
+
+def parse_bool(value: Any) -> bool:
+    """Coerce a query-string value to a bool, raising ValueError if it isn't one."""
+    text = str(value).strip().lower()
+    if text in _TRUE_STRINGS:
+        return True
+    if text in _FALSE_STRINGS:
+        return False
+    raise ValueError(f"Not a boolean value: {value!r}")
+
+
+def coerce_filter_value(column: Any, raw_val: Any, override: Optional[Callable] = None) -> Any:
+    """Coerce a raw query-string value to the Python type the column expects.
+
+    Coercing everything with ``str`` bound the text "true" against a Boolean
+    column. SQLite stores booleans as 0/1 integers, so the comparison was always
+    false and a filter like ``?rental_available=true`` silently returned zero
+    rows even when matching ones existed. Infer the type from the column and let
+    an explicit ``filter_types`` entry override it.
+    """
+    if override is not None:
+        return override(raw_val)
+
+    coltype = getattr(column, "type", None)
+    if coltype is None:
+        return str(raw_val)
+
+    if isinstance(coltype, Boolean):
+        return parse_bool(raw_val)
+    if isinstance(coltype, Float):
+        return float(raw_val)
+    if isinstance(coltype, (Integer, Numeric)):
+        return int(raw_val)
+    return str(raw_val)
+
+
 def apply_filters(
     stmt: Any,
     model: Any,
@@ -143,19 +186,26 @@ def apply_filters(
     for key, raw_val in args.items():
         if key not in allowed or not hasattr(model, key):
             continue
-        if raw_val is None or raw_val.lower() in ("undefined", ""):
+        if raw_val is None:
             continue
-
-        coerce_fn = coercions.get(key, str)
-        try:
-            if raw_val.lower() in ("null", "none"):
-                val = None
-            else:
-                val = coerce_fn(raw_val)
-        except (ValueError, TypeError):
+        text = str(raw_val).strip().lower()
+        if text in ("undefined", ""):
             continue
 
         col = getattr(model, key)
+        try:
+            if text in ("null", "none"):
+                val = None
+            else:
+                val = coerce_filter_value(col, raw_val, coercions.get(key))
+        except (ValueError, TypeError):
+            # A value that cannot be parsed as the column's type cannot match any
+            # row, so constrain the statement to nothing. Dropping the clause
+            # instead would silently answer with the *whole* table, turning a
+            # typo -- or a probe like ?is_active=x -- into an unfiltered read.
+            stmt = stmt.where(false())
+            continue
+
         if val is None:
             stmt = stmt.where(col.is_(None))
         else:
