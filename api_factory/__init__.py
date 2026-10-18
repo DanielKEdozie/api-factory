@@ -13,7 +13,7 @@ from .converters import IntOrStrConverter
 from .exporters import build_csv_response
 
 from .context import ContextValues
-from .custom_view import create_resource_view
+from .custom_view import create_resource_view, ResourceContext
 
 __version__ = "1.0.0"
 
@@ -33,4 +33,5 @@ __all__ = [
     "build_csv_response",
     "ContextValues",
     "create_resource_view",
+    "ResourceContext",
 ]

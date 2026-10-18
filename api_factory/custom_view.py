@@ -1,7 +1,7 @@
 import inspect
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Union
-from flask import current_app, jsonify, make_response, request, Response
+from flask import current_app, g, jsonify, make_response, request, Response
 from flask.views import View
 
 try:
@@ -13,6 +13,55 @@ except ImportError:
             super().__init__(str(messages))
 
 from .context import ContextValues
+
+
+class ResourceContext:
+    """Request-scoped execution context providing access to resource configuration,
+    database session, validated data, and resolved parent records.
+    """
+
+    def __init__(
+        self,
+        builder: Any = None,
+        item: Optional[Any] = None,
+        data: Optional[Any] = None,
+        value: Optional[ContextValues] = None,
+        schema: Optional[Any] = None,
+        session: Optional[Any] = None,
+    ):
+        self.builder = builder
+        self.item = item
+        self.data = data
+        self.value = value if value is not None else ContextValues()
+        self.values = self.value
+        self.schema = schema or getattr(builder, "schema", None)
+        self.model = getattr(builder, "model", None)
+        self.session = session or getattr(builder, "session", None)
+        self.db = getattr(builder, "db", None) or getattr(builder, "_db", None)
+        self.endpoint_name = getattr(builder, "endpoint_name", None)
+        self.route_prefix = getattr(builder, "route_prefix", None)
+
+    @property
+    def parent_record(self) -> Optional[Any]:
+        return self.value.get("parent_record") if self.value else None
+
+    @property
+    def parent(self) -> Optional[Any]:
+        return self.parent_record
+
+    def __getitem__(self, item):
+        if self.value and item in self.value:
+            return self.value[item]
+        raise KeyError(item)
+
+    def __getattr__(self, name):
+        # 1. Check value container first (e.g. ctx.equipment)
+        if "value" in self.__dict__ and self.value and name in self.value:
+            return self.value[name]
+        # 2. Delegate to underlying builder
+        if "builder" in self.__dict__ and self.builder is not None:
+            return getattr(self.builder, name)
+        raise AttributeError(f"'ResourceContext' object has no attribute '{name}'")
 
 
 def create_resource_view(
@@ -40,12 +89,19 @@ def create_resource_view(
 
     Supports:
       - Automatic view name resolution: pass view=OrderView or view=OrderView.as_view('orders')
-      - Injected builder context ('ctx' / 'builder') into functions and MethodView instances
+      - Injected ResourceContext ('ctx' / 'builder') providing:
+          * ctx.model: SQLAlchemy model
+          * ctx.schema: Marshmallow schema
+          * ctx.session: SQLAlchemy session
+          * ctx.value / ctx.values: ContextValues container
+          * ctx.parent_record / ctx.parent: resolved parent record
+          * ctx.item: resolved model instance (when detail=True)
+          * ctx.data: validated request payload
       - Signature-based parameter injection:
           * 'data': validated request JSON (or raw JSON if validation skipped)
           * 'schema': instantiated Marshmallow Schema
           * 'item': resolved model instance (when detail=True)
-          * 'ctx' / 'builder' / 'resource': ResourceBuilder instance and configuration
+          * 'ctx' / 'builder' / 'resource': ResourceContext instance
           * 'value' / 'values': ContextValues container
     """
     if validate is not None and schema_validation is None:
@@ -72,12 +128,14 @@ def create_resource_view(
         if active_schema is not None:
             schema_instance = active_schema() if isinstance(active_schema, type) else active_schema
 
+        target_model = model or getattr(context_obj, "model", None)
+
         if is_cbv_class:
             # Auto-resolve view name: attach context to class and call .as_view(ep)
             setattr(handler_callable, "schema", schema_instance)
             setattr(handler_callable, "ctx", context_obj)
             setattr(handler_callable, "builder", context_obj)
-            setattr(handler_callable, "model", model)
+            setattr(handler_callable, "model", target_model)
             view_func = handler_callable.as_view(ep)
         elif has_view_class:
             # Already called .as_view(...): attach context to underlying view_class
@@ -85,7 +143,7 @@ def create_resource_view(
             setattr(view_cls, "schema", schema_instance)
             setattr(view_cls, "ctx", context_obj)
             setattr(view_cls, "builder", context_obj)
-            setattr(view_cls, "model", model)
+            setattr(view_cls, "model", target_model)
             view_func = handler_callable
         else:
             view_func = handler_callable
@@ -112,28 +170,55 @@ def create_resource_view(
 
             # If detail=True and model is known, resolve item
             item = None
-            if detail and model is not None:
+            active_model = target_model
+            active_session = db_session or getattr(context_obj, "session", None)
+            if active_session is None and hasattr(current_app, "extensions") and "sqlalchemy" in current_app.extensions:
+                active_session = current_app.extensions["sqlalchemy"].session
+
+            if detail and active_model is not None:
                 pk_val = (
                     view_kwargs.get(pk_name)
-                    or (view_kwargs.get(f"{model.__name__.lower()}_{pk_name}") if model else None)
-                    or (view_kwargs.get(f"{model.__name__.lower()}_id") if model else None)
+                    or (view_kwargs.get(f"{active_model.__name__.lower()}_{pk_name}") if active_model else None)
+                    or (view_kwargs.get(f"{active_model.__name__.lower()}_id") if active_model else None)
                     or view_kwargs.get("id")
                     or view_kwargs.get("pk")
                 )
-                session = db_session
-                if session is None and hasattr(current_app, "extensions") and "sqlalchemy" in current_app.extensions:
-                    session = current_app.extensions["sqlalchemy"].session
-                if session is not None and pk_val is not None:
+                if active_session is not None and pk_val is not None:
                     try:
                         if isinstance(pk_val, str) and pk_val.isdigit():
-                            item = session.get(model, int(pk_val))
+                            item = active_session.get(active_model, int(pk_val))
                         else:
-                            item = session.get(model, pk_val)
+                            item = active_session.get(active_model, pk_val)
                     except Exception:
-                        item = session.get(model, pk_val)
+                        item = active_session.get(active_model, pk_val)
 
                     if item is None:
-                        return jsonify({"error": "Not Found", "message": f"{model.__name__} {pk_val} not found"}), 404
+                        return jsonify({"error": "Not Found", "message": f"{active_model.__name__} {pk_val} not found"}), 404
+
+            # Resolve parent records into ContextValues
+            val_ctx = None
+            if hasattr(context_obj, "_validate_view_args"):
+                val_ctx = context_obj._validate_view_args(view_kwargs)
+                val_ctx.item = item
+                val_ctx.data = validated_data
+            else:
+                val_ctx = ContextValues(item=item, data=validated_data)
+
+            # Create request-scoped ResourceContext
+            req_ctx = ResourceContext(
+                builder=context_obj,
+                item=item,
+                data=validated_data,
+                value=val_ctx,
+                schema=schema_instance,
+                session=active_session,
+            )
+            g.ctx = req_ctx
+
+            if is_cbv_class or has_view_class:
+                view_cls = handler_callable if is_cbv_class else handler_callable.view_class
+                setattr(view_cls, "ctx", req_ctx)
+                setattr(view_cls, "builder", req_ctx)
 
             # Inspect callable parameters to inject what was requested
             if not is_cbv_class and not has_view_class and callable(view_func):
@@ -149,28 +234,36 @@ def create_resource_view(
                         call_kwargs["schema"] = schema_instance
                     if "item" in params or has_var_kwargs:
                         call_kwargs["item"] = item
-                    if model is not None and model.__name__.lower() in params:
-                        call_kwargs[model.__name__.lower()] = item
+                    if active_model is not None and active_model.__name__.lower() in params:
+                        call_kwargs[active_model.__name__.lower()] = item
                     if "ctx" in params or has_var_kwargs:
-                        call_kwargs["ctx"] = context_obj
+                        call_kwargs["ctx"] = req_ctx
                     if "builder" in params:
-                        call_kwargs["builder"] = context_obj
+                        call_kwargs["builder"] = req_ctx
                     if "resource" in params:
-                        call_kwargs["resource"] = context_obj
-                    if "value" in params or "values" in params:
-                        val_ctx = ContextValues(item=item, data=validated_data)
-                        if "value" in params:
-                            call_kwargs["value"] = val_ctx
-                        if "values" in params:
-                            call_kwargs["values"] = val_ctx
+                        call_kwargs["resource"] = req_ctx
+                    if "value" in params:
+                        call_kwargs["value"] = val_ctx
+                    if "values" in params:
+                        call_kwargs["values"] = val_ctx
+                    if "parent" in params:
+                        call_kwargs["parent"] = req_ctx.parent_record
+                    if "parent_record" in params:
+                        call_kwargs["parent_record"] = req_ctx.parent_record
+                    for k, v in val_ctx.items():
+                        if k in params:
+                            call_kwargs[k] = v
 
                     # Filter call_kwargs to only accepted parameters if no **kwargs
                     if not has_var_kwargs:
                         call_kwargs = {k: v for k, v in call_kwargs.items() if k in params}
 
                     res = view_func(*view_args, **call_kwargs)
-                except TypeError:
-                    res = view_func(*view_args, **view_kwargs)
+                except Exception as exc:
+                    if "res" not in locals():
+                        res = view_func(*view_args, **view_kwargs)
+                    else:
+                        raise exc
             else:
                 res = view_func(*view_args, **view_kwargs)
 
